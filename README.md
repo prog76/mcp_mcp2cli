@@ -32,6 +32,18 @@ mcp2cli call query_prometheus --args expr=up --args datasourceUid=<uid>
 mcp2cli call query_prometheus --args-json '{"expr":"up"}' --args-json -
 ```
 
+### List prompts
+```bash
+mcp2cli list-prompts
+```
+
+### Get a prompt (rendered)
+```bash
+mcp2cli get-prompt infra_bootstrap
+mcp2cli get-prompt myprompt --args-json '{"name":"bob"}'
+mcp2cli get-prompt myprompt --args-json -   # read args JSON from stdin
+```
+
 ### `@stdin` marker
 Pipe content into `@stdin`-marked args:
 ```bash

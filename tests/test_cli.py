@@ -88,3 +88,72 @@ class TestCLIParsing:
         rc = main(["call", "test_tool", "--args", "query.text=hello", "--args", "labels[]=x"])
         assert rc == 0
         assert captured["arguments"] == {"query": {"text": "hello"}, "labels": ["x"]}
+
+    def test_list_prompts_no_prompts(self, monkeypatch):
+        import mcp2cli.cli as cli_mod
+
+        monkeypatch.setattr(cli_mod, "fetch_prompt_list", lambda *a, **kw: [])
+        rc = main(["list-prompts"])
+        assert rc == 0
+
+    def test_list_prompts_prints_entries(self, monkeypatch, capsys):
+        import mcp2cli.cli as cli_mod
+
+        fake = [
+            {"name": "a_boot", "description": "Bootstrap prompt", "arguments": []},
+            {"name": "b_help", "description": "", "arguments": [{"name": "topic"}]},
+        ]
+        monkeypatch.setattr(cli_mod, "fetch_prompt_list", lambda *a, **kw: fake)
+        rc = main(["list-prompts"])
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "- a_boot  Bootstrap prompt" in out
+        assert "- b_help" in out
+        assert "arguments: topic" in out
+
+    def test_get_prompt_passes_name_and_no_args(self, monkeypatch, capsys):
+        import mcp2cli.cli as cli_mod
+
+        captured = {}
+
+        def fake_get(endpoint, name, arguments=None):
+            captured["name"] = name
+            captured["arguments"] = arguments
+            return "rendered body"
+
+        monkeypatch.setattr(cli_mod, "get_prompt", fake_get)
+        monkeypatch.setattr(cli_mod, "handle_large_output", lambda out, **kw: out)
+        rc = main(["get-prompt", "a_boot"])
+        assert rc == 0
+        assert captured["name"] == "a_boot"
+        assert captured["arguments"] is None
+
+    def test_get_prompt_with_args_json(self, monkeypatch):
+        import mcp2cli.cli as cli_mod
+
+        captured = {}
+
+        def fake_get(endpoint, name, arguments=None):
+            captured["arguments"] = arguments
+            return "ok"
+
+        monkeypatch.setattr(cli_mod, "get_prompt", fake_get)
+        monkeypatch.setattr(cli_mod, "handle_large_output", lambda out, **kw: out)
+        rc = main(["get-prompt", "my_prompt", "--args-json", '{"name": "bob"}'])
+        assert rc == 0
+        assert captured["arguments"] == {"name": "bob"}
+
+    def test_get_prompt_invalid_args_json(self, monkeypatch):
+        import mcp2cli.cli as cli_mod
+
+        monkeypatch.setattr(cli_mod, "get_prompt", lambda *a, **kw: "ok")
+        rc = main(["get-prompt", "my_prompt", "--args-json", "{bad"])
+        assert rc == 2
+
+    def test_get_prompt_error_result_returns_1(self, monkeypatch, capsys):
+        import mcp2cli.cli as cli_mod
+
+        monkeypatch.setattr(cli_mod, "get_prompt", lambda *a, **kw: "Error getting prompt 'x': boom")
+        monkeypatch.setattr(cli_mod, "handle_large_output", lambda out, **kw: out)
+        rc = main(["get-prompt", "x"])
+        assert rc == 1

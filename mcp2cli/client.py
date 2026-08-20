@@ -7,7 +7,7 @@ argparse logic; it exposes callables that accept plain Python values and
 return plain Python values.
 
 Used by:
-  - mcp2cli.cli  (CLI: list-servers, list-tools, describe, call)
+  - mcp2cli.cli  (CLI: list-servers, list-tools, describe, call, list-prompts, get-prompt)
   - skills_server (native MCP tools: mcp_list_upstreams, mcp_call, ...)
 """
 
@@ -295,6 +295,94 @@ def call_tool(
         return out
     except Exception as e:
         return _format_tool_call_error(tool_id, endpoint, timeout_seconds, e)
+
+
+# ---------------------------------------------------------------------------
+# Prompt listing / fetching (MCP `prompts/list` and `prompts/get`)
+# ---------------------------------------------------------------------------
+
+async def _fetch_prompt_list_live(endpoint: str) -> List[Dict[str, Any]]:
+    """Fetch the prompt catalog from the endpoint (prompts/list)."""
+    async with streamablehttp_client(endpoint) as (r, w, _):
+        async with ClientSession(r, w) as s:
+            await s.initialize()
+            prompts = (await s.list_prompts()).prompts or []
+            out: List[Dict[str, Any]] = []
+            for p in prompts:
+                args = []
+                for a in (getattr(p, "arguments", None) or []):
+                    args.append(
+                        {
+                            "name": getattr(a, "name", ""),
+                            "description": getattr(a, "description", "") or "",
+                            "required": bool(getattr(a, "required", False)),
+                        }
+                    )
+                out.append(
+                    {
+                        "name": getattr(p, "name", ""),
+                        "description": getattr(p, "description", "") or "",
+                        "arguments": args,
+                    }
+                )
+            return out
+
+
+def fetch_prompt_list(endpoint: str) -> List[Dict[str, Any]]:
+    """List prompts available on the endpoint (sync wrapper)."""
+    try:
+        return asyncio.run(_fetch_prompt_list_live(endpoint))
+    except Exception as e:
+        log.warning("Could not fetch prompt list: endpoint=%s error=%s", endpoint, e)
+        return []
+
+
+def _format_prompt_content(content: Any) -> str:
+    """Extract a prompt message's content as plain text."""
+    text = getattr(content, "text", None)
+    if isinstance(text, str):
+        return text
+    # ResourceLink / EmbeddedResource and others without a `.text`.
+    return repr(content)
+
+
+def _format_prompt_result(result: Any) -> str:
+    """Format a GetPromptResult into a human-readable prompt body."""
+    description = getattr(result, "description", None) or ""
+    messages = getattr(result, "messages", None) or []
+    parts: List[str] = []
+    if description:
+        parts.append(f"# {description}")
+    for msg in messages:
+        role = getattr(msg, "role", "user")
+        content = _format_prompt_content(getattr(msg, "content", None))
+        parts.append(f"[{role}]\n{content}")
+    return "\n\n".join(parts)
+
+
+async def _get_prompt_live(
+    endpoint: str,
+    name: str,
+    arguments: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Fetch and render a single prompt by name (prompts/get)."""
+    async with streamablehttp_client(endpoint) as (r, w, _):
+        async with ClientSession(r, w) as s:
+            await s.initialize()
+            result = await s.get_prompt(name, arguments)
+            return _format_prompt_result(result)
+
+
+def get_prompt(
+    endpoint: str,
+    name: str,
+    arguments: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Render a single prompt by name (sync wrapper)."""
+    try:
+        return asyncio.run(_get_prompt_live(endpoint, name, arguments))
+    except Exception as e:
+        return f"Error getting prompt '{name}': {e}"
 
 
 # ---------------------------------------------------------------------------

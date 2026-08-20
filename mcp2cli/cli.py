@@ -30,8 +30,10 @@ from mcp2cli.client import (
     _default_workspace_dir,
     _split_server_prefix,
     call_tool,
+    fetch_prompt_list,
     fetch_tool_list,
     format_tool_schema,
+    get_prompt,
     handle_large_output,
     resolve_tool_id,
 )
@@ -289,6 +291,54 @@ def cmd_call(args: argparse.Namespace) -> int:
     return 0 if not is_error else 1
 
 
+def cmd_list_prompts(args: argparse.Namespace) -> int:
+    """List prompts available on the endpoint (prompts/list)."""
+    endpoint = args.endpoint
+    prompts = fetch_prompt_list(endpoint)
+    if not prompts:
+        print("No prompts available on this endpoint.")
+        print("Tip: run `mcp2cli list-servers` to check the endpoint, or `mcp2cli list-tools <prefix>`.")
+        return 0
+
+    for p in prompts:
+        name = p.get("name") or ""
+        desc = (p.get("description") or "").strip()
+        first_line = desc.splitlines()[0] if desc else ""
+        line = f"- {name}"
+        if first_line:
+            line += f"  {first_line}"
+        print(line)
+        args_list = [a.get("name", "") for a in (p.get("arguments") or [])]
+        if args_list:
+            print(f"    arguments: {', '.join(args_list)}")
+    return 0
+
+
+def cmd_get_prompt(args: argparse.Namespace) -> int:
+    """Render a single prompt by name (prompts/get)."""
+    endpoint = args.endpoint
+    name = args.prompt_name
+
+    arguments: Optional[Dict[str, Any]] = None
+    if args.args_json:
+        try:
+            raw = sys.stdin.read() if args.args_json == "-" else args.args_json
+            parsed = json.loads(raw) if raw.strip() else {}
+            if not isinstance(parsed, dict):
+                print("--args-json must be a JSON object.")
+                return 2
+            arguments = parsed
+        except json.JSONDecodeError as e:
+            print(f"Invalid --args-json: {e.msg} (pos={e.pos}, line={getattr(e, 'lineno', None)})")
+            return 2
+
+    out = get_prompt(endpoint, name, arguments)
+    is_error = out.startswith("Error getting prompt")
+    result = handle_large_output(out, is_error=is_error, workspace_dir=Path(args.workspace_dir), threshold=int(args.output_threshold_chars))
+    print(result)
+    return 0 if not is_error else 1
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="mcp2cli wrapper for policy-proxy endpoints")
     # Kept for backwards compatibility with older wrapper versions.
@@ -351,6 +401,23 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     p_call.add_argument("--timeout-seconds", type=int, default=DEFAULT_TOOL_TIMEOUT_SECONDS)
     p_call.set_defaults(func=cmd_call)
+
+    p_list_prompts = sub.add_parser("list-prompts", help="List prompts available on the endpoint")
+    p_list_prompts.set_defaults(func=cmd_list_prompts)
+
+    p_get_prompt = sub.add_parser("get-prompt", help="Render a single prompt by name")
+    p_get_prompt.add_argument("prompt_name", help="Prompt name as shown by `list-prompts`")
+    p_get_prompt.add_argument(
+        "--args-json",
+        default=None,
+        help='JSON object of prompt arguments, or "-" to read from stdin (default: no arguments)',
+    )
+    p_get_prompt.add_argument(
+        "--output-threshold-chars",
+        type=int,
+        default=int(os.environ.get("MCP2CLI_OUTPUT_THRESHOLD_CHARS", DEFAULT_OUTPUT_THRESHOLD_CHARS)),
+    )
+    p_get_prompt.set_defaults(func=cmd_get_prompt)
 
     args = parser.parse_args(argv)
     return int(args.func(args) or 0)
