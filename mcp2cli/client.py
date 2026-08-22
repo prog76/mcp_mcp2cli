@@ -137,6 +137,7 @@ async def _fetch_tool_list_live(endpoint: str) -> List[Dict[str, Any]]:
                         "name": t.name,
                         "description": getattr(t, "description", "") or "",
                         "inputSchema": getattr(t, "inputSchema", None),
+                        "outputSchema": getattr(t, "outputSchema", None),
                     }
                 )
             return out
@@ -192,15 +193,19 @@ def format_tool_schema(tool_obj: Dict[str, Any]) -> str:
                 "schema_empty": True,
                 "note": "MCP returned an empty input schema for this tool. Use tool description/examples as the source of parameter hints.",
             }
-    return json.dumps(
-        {
-            "tool_id": tool_obj.get("name") or tool_obj.get("tool_id"),
-            "description": desc,
-            "parameters": params,
-        },
-        indent=2,
-        ensure_ascii=False,
-    )
+    out: Dict[str, Any] = {
+        "tool_id": tool_obj.get("name") or tool_obj.get("tool_id"),
+        "description": desc,
+        "parameters": params,
+    }
+    # Emit the advertised output schema only when the serving compound exposes
+    # one. Browser-facing compounds with ``schema: minimal`` strip outputSchema
+    # from tools/list at the proxy (MountedServer), so ``describe`` omits it
+    # there — the stripping is controlled in that single place, not here.
+    output_schema = tool_obj.get("outputSchema") or tool_obj.get("output_schema")
+    if output_schema is not None:
+        out["output"] = output_schema
+    return json.dumps(out, indent=2, ensure_ascii=False)
 
 
 # ---------------------------------------------------------------------------
