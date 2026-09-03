@@ -22,7 +22,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Awaitable
 
 from mcp import ClientSession
 try:
@@ -233,11 +233,17 @@ def resolve_tool_id(provided_tool_id: str, tool_names: List[str]) -> str:
 # Tool calling
 # ---------------------------------------------------------------------------
 
-async def _call_tool_live(endpoint: str, tool_id: str, arguments: Dict[str, Any]) -> Any:
+async def _call_tool_live(
+    endpoint: str,
+    tool_id: str,
+    arguments: Dict[str, Any],
+    progress_callback: Optional[Callable[[float, Optional[float], Optional[str]], Awaitable[None]]] = None,
+) -> Any:
     async with streamablehttp_client(endpoint) as (r, w, _):
         async with ClientSession(r, w) as s:
             await s.initialize()
-            return await s.call_tool(tool_id, arguments)
+            return await s.call_tool(tool_id, arguments,
+                                     progress_callback=progress_callback)
 
 
 def _format_tool_call_error(tool_id: str, endpoint: str, timeout_seconds: int, exc: BaseException) -> str:

@@ -26,6 +26,12 @@ mcp2cli list-tools grafana-infra,k8s
 mcp2cli describe k8s_pods_get,grafana-infra_query_prometheus
 ```
 
+`describe` prints the tool's `tool_id`, `description`, and `parameters` (input
+schema). When the serving compound advertises an `outputSchema`, the result also
+includes an `output` field. Compounds with `schema: minimal` (browser-facing)
+strip `outputSchema`, so `describe` there omits `output` — controlled by
+`deploy/config/compounds.yaml`.
+
 ### Call a tool
 ```bash
 mcp2cli call query_prometheus --args expr=up --args datasourceUid=<uid>
