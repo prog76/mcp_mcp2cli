@@ -246,6 +246,42 @@ async def _call_tool_live(
                                      progress_callback=progress_callback)
 
 
+def _flatten_exception(exc: BaseException) -> str:
+    """Best-effort extract a readable message from an exception.
+
+    ``str()`` of an :class:`ExceptionGroup` only prints the top label
+    (e.g. ``unhandled errors in a TaskGroup (1 sub-exception)``),
+    hiding the real cause one level down.  The gateway/MCP async layer wraps
+    downstream failures in task groups, so this recurses into the leaves and
+    returns the innermost (most specific) leaf as ``"TypeName: message"``.
+    """
+
+    def _leaves(e: BaseException):
+        """Yield every non-group leaf, tracking nesting depth."""
+        seen = set()
+        stack = [(e, 0)]
+        while stack:
+            cur, depth = stack.pop()
+            if isinstance(cur, (BaseExceptionGroup, ExceptionGroup)):
+                if id(cur) in seen:
+                    continue
+                seen.add(id(cur))
+                for sub in getattr(cur, "exceptions", ()):
+                    stack.append((sub, depth + 1))
+            else:
+                yield cur, depth
+
+    best = None
+    best_depth = -1
+    for leaf, depth in _leaves(exc):
+        if depth > best_depth:
+            best, best_depth = leaf, depth
+    if best is not None:
+        msg = (str(best).strip() or repr(best))
+        return f"{type(best).__name__}: {msg}"
+    return str(exc).strip() or type(exc).__name__
+
+
 def _format_tool_call_error(tool_id: str, endpoint: str, timeout_seconds: int, exc: BaseException) -> str:
     if isinstance(exc, asyncio.TimeoutError):
         log.warning(
@@ -265,7 +301,7 @@ def _format_tool_call_error(tool_id: str, endpoint: str, timeout_seconds: int, e
         endpoint,
         exc,
     )
-    return f"Error calling tool '{tool_id}': {exc}"
+    return f"Error calling tool '{tool_id}': {_flatten_exception(exc)}"
 
 
 async def call_tool_async(
