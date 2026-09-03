@@ -126,7 +126,10 @@ def save_cache(cache_dir: Path, endpoint: str, tools: List[Dict[str, Any]]) -> N
 # ---------------------------------------------------------------------------
 
 async def _fetch_tool_list_live(endpoint: str) -> List[Dict[str, Any]]:
-    async with streamablehttp_client(endpoint) as (r, w, _):
+    async with streamablehttp_client(endpoint) as _streams:
+        # mcp 1.x yields (read, write, get_session_id); mcp 2.x yields
+        # (read, write) — unpack by position so both major lines work.
+        r, w = _streams[0], _streams[1]
         async with ClientSession(r, w) as s:
             await s.initialize()
             tools = (await s.list_tools()).tools
@@ -239,7 +242,10 @@ async def _call_tool_live(
     arguments: Dict[str, Any],
     progress_callback: Optional[Callable[[float, Optional[float], Optional[str]], Awaitable[None]]] = None,
 ) -> Any:
-    async with streamablehttp_client(endpoint) as (r, w, _):
+    async with streamablehttp_client(endpoint) as _streams:
+        # mcp 1.x yields (read, write, get_session_id); mcp 2.x yields
+        # (read, write) — unpack by position so both major lines work.
+        r, w = _streams[0], _streams[1]
         async with ClientSession(r, w) as s:
             await s.initialize()
             return await s.call_tool(tool_id, arguments,
@@ -350,7 +356,10 @@ def call_tool(
 
 async def _fetch_prompt_list_live(endpoint: str) -> List[Dict[str, Any]]:
     """Fetch the prompt catalog from the endpoint (prompts/list)."""
-    async with streamablehttp_client(endpoint) as (r, w, _):
+    async with streamablehttp_client(endpoint) as _streams:
+        # mcp 1.x yields (read, write, get_session_id); mcp 2.x yields
+        # (read, write) — unpack by position so both major lines work.
+        r, w = _streams[0], _streams[1]
         async with ClientSession(r, w) as s:
             await s.initialize()
             prompts = (await s.list_prompts()).prompts or []
@@ -413,7 +422,10 @@ async def _get_prompt_live(
     arguments: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Fetch and render a single prompt by name (prompts/get)."""
-    async with streamablehttp_client(endpoint) as (r, w, _):
+    async with streamablehttp_client(endpoint) as _streams:
+        # mcp 1.x yields (read, write, get_session_id); mcp 2.x yields
+        # (read, write) — unpack by position so both major lines work.
+        r, w = _streams[0], _streams[1]
         async with ClientSession(r, w) as s:
             await s.initialize()
             result = await s.get_prompt(name, arguments)
