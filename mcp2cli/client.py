@@ -288,6 +288,33 @@ def _flatten_exception(exc: BaseException) -> str:
     return str(exc).strip() or type(exc).__name__
 
 
+def _format_tool_result(out_obj: Any) -> str:
+    """Compact rendering of a CallToolResult.
+
+    The raw SDK repr carries the payload twice (content blocks and
+    structuredContent) — and fastmcp wraps plain-string results into
+    structuredContent={"result": msg}, so a single tool message would be
+    printed multiple times.  Print the text payload once and append the
+    structured form only when it actually adds information.
+    """
+    blocks = getattr(out_obj, "content", None) or []
+    text = "\n".join(getattr(b, "text", "") for b in blocks
+                      if getattr(b, "type", None) == "text" or hasattr(b, "text"))
+    structured = getattr(out_obj, "structuredContent", None)
+    parts = []
+    if text.strip():
+        parts.append(text)
+    # structured adds info only when it is not just the text wrapped back
+    if structured is not None and structured != {"result": text}:
+        try:
+            parts.append("structured: " + json.dumps(structured, ensure_ascii=False))
+        except (TypeError, ValueError):
+            parts.append(f"structured: {structured!r}")
+    if not parts:
+        return str(out_obj)  # nothing recognisable — fall back to the raw repr
+    return "\n".join(parts)
+
+
 def _format_tool_call_error(tool_id: str, endpoint: str, timeout_seconds: int, exc: BaseException) -> str:
     if isinstance(exc, asyncio.TimeoutError):
         log.warning(
@@ -323,8 +350,7 @@ async def call_tool_async(
 
     try:
         out_obj = await asyncio.wait_for(_call_tool_live(endpoint, tool_id, call_args), timeout=timeout_seconds)
-        out = str(out_obj)
-        return out
+        return _format_tool_result(out_obj)
     except Exception as e:
         return _format_tool_call_error(tool_id, endpoint, timeout_seconds, e)
 
@@ -344,8 +370,7 @@ def call_tool(
         out_obj = asyncio.run(
             asyncio.wait_for(_call_tool_live(endpoint, tool_id, call_args), timeout=timeout_seconds)
         )
-        out = str(out_obj)
-        return out
+        return _format_tool_result(out_obj)
     except Exception as e:
         return _format_tool_call_error(tool_id, endpoint, timeout_seconds, e)
 
