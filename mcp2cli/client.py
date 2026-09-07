@@ -125,7 +125,12 @@ def save_cache(cache_dir: Path, endpoint: str, tools: List[Dict[str, Any]]) -> N
 # Live fetching
 # ---------------------------------------------------------------------------
 
-async def _fetch_tool_list_live(endpoint: str) -> List[Dict[str, Any]]:
+async def _fetch_tool_list_unbounded(endpoint: str) -> List[Dict[str, Any]]:
+    """Raw, unbounded tool-list fetch.
+
+    Prefer :func:`_fetch_tool_list_live`, which wraps this in a timeout. This
+    split exists so the timeout boundary is explicit and testable.
+    """
     async with streamablehttp_client(endpoint) as _streams:
         # mcp 1.x yields (read, write, get_session_id); mcp 2.x yields
         # (read, write) — unpack by position so both major lines work.
@@ -144,6 +149,24 @@ async def _fetch_tool_list_live(endpoint: str) -> List[Dict[str, Any]]:
                     }
                 )
             return out
+
+
+async def _fetch_tool_list_live(endpoint: str) -> List[Dict[str, Any]]:
+    """Fetch the live tool list from ``endpoint``, bounded by ``DEFAULT_TOOL_TIMEOUT_SECONDS``.
+
+    The streamable-HTTP session (connect + ``initialize`` + ``tools/list``) has no
+    transport timeout of its own. Every bridge helper in ipybox and every
+    ``mcp2cli`` subcommand calls this first, so without this single bound an
+    unresponsive backend would block the caller forever — and, when that caller
+    is the FastMCP event loop, wedge the whole server (``execute_code``,
+    ``list-servers``, everything). That is exactly the failure we are hardening
+    against. The per-call ``wait_for`` is the mechanism that turns a hung
+    upstream into a :class:`TimeoutError` instead of a freeze.
+    """
+    return await asyncio.wait_for(
+        _fetch_tool_list_unbounded(endpoint),
+        timeout=DEFAULT_TOOL_TIMEOUT_SECONDS,
+    )
 
 
 async def fetch_tool_list_async(
