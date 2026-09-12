@@ -11,7 +11,7 @@ Covers the outputSchema passthrough for ``describe``:
     faithfully.
 """
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -28,14 +28,50 @@ class ToolFake:
         self.outputSchema = output_schema
 
 
-class _FakeHttpCM:
-    """Stand-in for the object returned by streamablehttp_client(endpoint)."""
+class _FakeResponse:
+    """Fake httpx.Response that returns tool data."""
+
+    def __init__(self, data, content_type="application/json"):
+        self._data = data
+        self._content_type = content_type
+
+    def raise_for_status(self):
+        pass
+
+    @property
+    def headers(self):
+        return {"content-type": self._content_type}
+
+    @property
+    def text(self):
+        return ""
+
+    def json(self):
+        return self._data
+
+
+class _FakeAsyncClient:
+    """Fake httpx.AsyncClient that returns predefined responses."""
+
+    def __init__(self, init_response, list_response):
+        self._init_response = init_response
+        self._list_response = list_response
+        self._call_count = 0
 
     async def __aenter__(self):
-        return (MagicMock(), MagicMock(), None)
+        return self
 
     async def __aexit__(self, *exc):
         return False
+
+    async def post(self, *args, **kwargs):
+        self._call_count += 1
+        if self._call_count == 1:
+            # First call is initialize
+            return self._init_response
+        else:
+            # Subsequent calls are tools/list
+            return self._list_response
 
 
 class TestFormatToolSchema:
@@ -78,43 +114,36 @@ class TestFetchToolListLive:
     @pytest.mark.asyncio
     async def test_captures_output_schema(self, monkeypatch):
         """fetch captures outputSchema so describe can reflect it (full schema)."""
-        session = AsyncMock()
-        session.initialize = AsyncMock()
-        session.list_tools = AsyncMock(
-            return_value=MagicMock(
-                tools=[
-                    ToolFake(
-                        name="gitlab_list_group_projects",
-                        input_schema={"type": "object"},
-                        output_schema={"type": "object", "properties": {"projects": {"type": "array"}}},
-                        description="List projects",
-                    )
+        # Fake responses for initialize and tools/list
+        init_response = _FakeResponse({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "serverInfo": {"name": "test", "version": "1.0"},
+            },
+        })
+
+        list_response = _FakeResponse({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {
+                "tools": [
+                    {
+                        "name": "gitlab_list_group_projects",
+                        "description": "List projects",
+                        "inputSchema": {"type": "object"},
+                        "outputSchema": {"type": "object", "properties": {"projects": {"type": "array"}}},
+                    }
                 ]
-            )
-        )
+            },
+        })
 
-        def fake_http_client(endpoint):
-            return _FakeHttpCM()
+        fake_client = _FakeAsyncClient(init_response, list_response)
+        monkeypatch.setattr(client.httpx, "AsyncClient", lambda *a, **k: fake_client)
 
-        class FakeClientSession:
-            def __init__(self, *a, **kw):
-                self._s = session
-
-            async def __aenter__(self):
-                return self._s
-
-            async def __aexit__(self, *exc):
-                return False
-
-        orig_client = client.streamablehttp_client
-        orig_session = client.ClientSession
-        client.streamablehttp_client = fake_http_client
-        client.ClientSession = FakeClientSession
-        try:
-            tools = await client._fetch_tool_list_live("http://fake/mcp/full")
-        finally:
-            client.streamablehttp_client = orig_client
-            client.ClientSession = orig_session
+        tools = await client._fetch_tool_list_live("http://fake/mcp/full")
 
         assert len(tools) == 1
         assert tools[0]["outputSchema"] == {"type": "object", "properties": {"projects": {"type": "array"}}}

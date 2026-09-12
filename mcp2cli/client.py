@@ -25,13 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Awaitable
 
-from mcp import ClientSession
-try:
-    # mcp 1.x
-    from mcp.client.streamable_http import streamablehttp_client
-except ImportError:
-    # mcp 2.x renamed to snake_case
-    from mcp.client.streamable_http import streamable_http_client as streamablehttp_client
+import httpx
 
 
 log = logging.getLogger(__name__)
@@ -132,24 +126,61 @@ async def _fetch_tool_list_unbounded(endpoint: str) -> List[Dict[str, Any]]:
     Prefer :func:`_fetch_tool_list_live`, which wraps this in a timeout. This
     split exists so the timeout boundary is explicit and testable.
     """
-    async with streamablehttp_client(endpoint) as _streams:
-        # mcp 1.x yields (read, write, get_session_id); mcp 2.x yields
-        # (read, write) — unpack by position so both major lines work.
-        r, w = _streams[0], _streams[1]
-        async with ClientSession(r, w) as s:
-            await s.initialize()
-            tools = (await s.list_tools()).tools
-            out: List[Dict[str, Any]] = []
-            for t in tools:
-                out.append(
-                    {
-                        "name": t.name,
-                        "description": getattr(t, "description", "") or "",
-                        "inputSchema": getattr(t, "inputSchema", None),
-                        "outputSchema": getattr(t, "outputSchema", None),
-                    }
-                )
-            return out
+    hdrs = {
+        "Accept": "application/json, text/event-stream",
+        "Content-Type": "application/json",
+    }
+    async with httpx.AsyncClient(timeout=120, follow_redirects=True) as c:
+        # Initialize the session
+        init_req = {
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "mcp2cli", "version": "0.1"},
+            },
+            "jsonrpc": "2.0",
+            "id": 1,
+        }
+        resp = await c.post(endpoint, json=init_req, headers=hdrs)
+        resp.raise_for_status()
+
+        # Extract session ID from response headers
+        session_id = resp.headers.get("mcp-session-id", "")
+        if session_id:
+            hdrs["Mcp-Session-Id"] = session_id
+
+        # Parse initialize response to check for errors
+        init_data = _parse_response(resp)
+        if "error" in init_data:
+            raise RuntimeError(f"Initialize failed: {init_data['error']}")
+
+        # List tools with session ID
+        list_req = {
+            "method": "tools/list",
+            "params": {},
+            "jsonrpc": "2.0",
+            "id": 2,
+        }
+        resp2 = await c.post(endpoint, json=list_req, headers=hdrs)
+        resp2.raise_for_status()
+
+        result = _parse_response(resp2)
+        if "error" in result:
+            raise RuntimeError(f"Tools list failed: {result['error']}")
+
+        tools = result.get("result", {}).get("tools", [])
+        out: List[Dict[str, Any]] = []
+        for t in tools:
+            out.append(
+                {
+                    "name": t.get("name", ""),
+                    "description": t.get("description", "") or "",
+                    "inputSchema": t.get("inputSchema"),
+                    "outputSchema": t.get("outputSchema"),
+                }
+            )
+        return out
 
 
 async def _fetch_tool_list_live(endpoint: str) -> List[Dict[str, Any]]:
@@ -266,14 +297,105 @@ async def _call_tool_live(
     arguments: Dict[str, Any],
     progress_callback: Optional[Callable[[float, Optional[float], Optional[str]], Awaitable[None]]] = None,
 ) -> Any:
-    async with streamablehttp_client(endpoint) as _streams:
-        # mcp 1.x yields (read, write, get_session_id); mcp 2.x yields
-        # (read, write) — unpack by position so both major lines work.
-        r, w = _streams[0], _streams[1]
-        async with ClientSession(r, w) as s:
-            await s.initialize()
-            return await s.call_tool(tool_id, arguments,
-                                     progress_callback=progress_callback)
+    """Call a tool via streamable HTTP with proper session ID handling.
+
+    The MCP SDK v1.30.0 has a bug where it doesn't always resend the
+    Mcp-Session-Id header on subsequent requests after initialize().
+    This implementation uses raw HTTP (like skill_runner.py) to ensure
+    the session header is always included.
+    """
+    hdrs = {
+        "Accept": "application/json, text/event-stream",
+        "Content-Type": "application/json",
+    }
+    async with httpx.AsyncClient(timeout=120, follow_redirects=True) as c:
+        # Initialize the session
+        init_req = {
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "mcp2cli", "version": "0.1"},
+            },
+            "jsonrpc": "2.0",
+            "id": 1,
+        }
+        resp = await c.post(endpoint, json=init_req, headers=hdrs)
+        resp.raise_for_status()
+
+        # Extract session ID from response headers
+        session_id = resp.headers.get("mcp-session-id", "")
+        if session_id:
+            hdrs["Mcp-Session-Id"] = session_id
+
+        # Parse initialize response to check for errors
+        init_data = _parse_response(resp)
+        if "error" in init_data:
+            raise RuntimeError(f"Initialize failed: {init_data['error']}")
+
+        # Call the tool with session ID
+        call_req = {
+            "method": "tools/call",
+            "params": {"name": tool_id, "arguments": arguments},
+            "jsonrpc": "2.0",
+            "id": 2,
+        }
+
+        # Request progress notifications if callback provided
+        if progress_callback is not None:
+            call_req["params"]["_meta"] = {"progressToken": str(uuid.uuid4())}
+
+        resp2 = await c.post(endpoint, json=call_req, headers=hdrs)
+        resp2.raise_for_status()
+
+        result = _parse_response(resp2, progress_callback=progress_callback)
+        if "error" in result:
+            raise RuntimeError(f"Tool call failed: {result['error']}")
+
+        return result
+
+
+def _parse_response(
+    resp: httpx.Response,
+    progress_callback: Optional[Callable[[float, Optional[float], Optional[str]], Awaitable[None]]] = None,
+) -> Dict[str, Any]:
+    """Parse MCP response handling both JSON and SSE formats.
+
+    If progress_callback is provided, progress notifications found in SSE
+    frames will be forwarded to the callback.
+    """
+    content_type = resp.headers.get("content-type", "")
+    if "text/event-stream" in content_type:
+        data = {}
+        for frame in resp.text.split("\n\n"):
+            for line in frame.splitlines():
+                if line.startswith("data:"):
+                    try:
+                        d = json.loads(line[5:].strip())
+                    except ValueError:
+                        continue
+                    if not isinstance(d, dict):
+                        continue
+                    # Check for progress notification
+                    if (progress_callback is not None
+                            and d.get("method") == "notifications/progress"
+                            and "params" in d):
+                        params = d["params"]
+                        try:
+                            progress = float(params.get("progress", 0))
+                            total = params.get("total")
+                            if total is not None:
+                                total = float(total)
+                            message = params.get("message")
+                            asyncio.create_task(progress_callback(progress, total, message))
+                        except (ValueError, TypeError):
+                            pass
+                        continue
+                    if "result" in d or "error" in d:
+                        data = d
+        return data
+    else:
+        return resp.json()
 
 
 # ---------------------------------------------------------------------------

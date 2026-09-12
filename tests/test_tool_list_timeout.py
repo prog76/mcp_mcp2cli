@@ -11,16 +11,17 @@ into a ``TimeoutError``.
 
 import asyncio
 import time
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from mcp2cli import client as mcp2cli_client
 
 
-class _HungClientSession:
-    """ClientSession stand-in whose initialize/list_tools never return."""
+class _HungAsyncClient:
+    """httpx.AsyncClient stand-in: connects, then the session hangs."""
 
-    def __init__(self, read_stream, write_stream):
+    def __init__(self, *args, **kwargs):
         pass
 
     async def __aenter__(self):
@@ -29,32 +30,34 @@ class _HungClientSession:
     async def __aexit__(self, *exc):
         return False
 
-    async def initialize(self):
+    async def post(self, *args, **kwargs):
+        # Simulate a hung endpoint that never responds
         await asyncio.sleep(3600)
-
-    async def list_tools(self):
-        await asyncio.sleep(3600)
+        return _HungResponse()
 
 
-class _HungStreams:
-    """streamablehttp_client stand-in: connects, then the session hangs."""
+class _HungResponse:
+    """Response (never reached because post hangs)."""
 
-    async def __aenter__(self):
-        # mcp2cli unpacks (_streams[0], _streams[1]); values are unused by the
-        # hung session above.
-        return (None, None)
+    def raise_for_status(self):
+        pass
 
-    async def __aexit__(self, *exc):
-        return False
+    @property
+    def headers(self):
+        return {}
+
+    @property
+    def text(self):
+        return ""
+
+    def json(self):
+        return {}
 
 
 def test_fetch_tool_list_live_times_out_when_endpoint_hangs(monkeypatch):
     """A hung tools/list must raise TimeoutError within the bound, not hang."""
     monkeypatch.setattr(mcp2cli_client, "DEFAULT_TOOL_TIMEOUT_SECONDS", 1)
-    monkeypatch.setattr(
-        mcp2cli_client, "streamablehttp_client", lambda _endpoint: _HungStreams()
-    )
-    monkeypatch.setattr(mcp2cli_client, "ClientSession", _HungClientSession)
+    monkeypatch.setattr(mcp2cli_client.httpx, "AsyncClient", _HungAsyncClient)
 
     start = time.monotonic()
     with pytest.raises(TimeoutError):
@@ -73,10 +76,7 @@ def test_fetch_tool_list_async_propagates_timeout_bounded(monkeypatch):
     ``TimeoutError`` — but it must do so within the bound, not hang.
     """
     monkeypatch.setattr(mcp2cli_client, "DEFAULT_TOOL_TIMEOUT_SECONDS", 1)
-    monkeypatch.setattr(
-        mcp2cli_client, "streamablehttp_client", lambda _endpoint: _HungStreams()
-    )
-    monkeypatch.setattr(mcp2cli_client, "ClientSession", _HungClientSession)
+    monkeypatch.setattr(mcp2cli_client.httpx, "AsyncClient", _HungAsyncClient)
 
     start = time.monotonic()
     with pytest.raises(TimeoutError):
