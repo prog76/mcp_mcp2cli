@@ -157,3 +157,151 @@ class TestCLIParsing:
         monkeypatch.setattr(cli_mod, "handle_large_output", lambda out, **kw: out)
         rc = main(["get-prompt", "x"])
         assert rc == 1
+
+
+class TestDirectKVArgs:
+    """Direct --key=value flags on `call` (rewritten to --args)."""
+
+    def _run_call(self, monkeypatch, argv):
+        import mcp2cli.cli as cli_mod
+
+        captured = {}
+
+        def fake_fetch(*a, **kw):
+            return [{"name": "test_tool", "description": "", "inputSchema": {}}]
+
+        def fake_call(endpoint, tool_id, arguments, **kw):
+            captured["arguments"] = arguments
+            return "ok"
+
+        monkeypatch.setattr(cli_mod, "fetch_tool_list", fake_fetch)
+        monkeypatch.setattr(cli_mod, "resolve_tool_id", lambda p, n: p)
+        monkeypatch.setattr(cli_mod, "call_tool", fake_call)
+        rc = main(argv)
+        return rc, captured
+
+    def test_direct_kv_becomes_tool_args(self, monkeypatch):
+        rc, captured = self._run_call(
+            monkeypatch,
+            ["call", "test_tool", "--context=devops", "--namespace=default"],
+        )
+        assert rc == 0
+        assert captured["arguments"] == {"context": "devops", "namespace": "default"}
+
+    def test_bare_flag_becomes_true(self, monkeypatch):
+        rc, captured = self._run_call(monkeypatch, ["call", "test_tool", "--verbose"])
+        assert rc == 0
+        assert captured["arguments"] == {"verbose": True}
+
+    def test_scalar_values_parsed(self, monkeypatch):
+        rc, captured = self._run_call(
+            monkeypatch,
+            ["call", "test_tool", "--count=42", "--ratio=1.5", "--off=false", "--name=abc"],
+        )
+        assert rc == 0
+        assert captured["arguments"] == {"count": 42, "ratio": 1.5, "off": False, "name": "abc"}
+
+    def test_dotted_and_array_direct_keys(self, monkeypatch):
+        rc, captured = self._run_call(
+            monkeypatch,
+            ["call", "test_tool", "--query.text=hello", "--labels[]=x", "--labels[]=y"],
+        )
+        assert rc == 0
+        assert captured["arguments"] == {"query": {"text": "hello"}, "labels": ["x", "y"]}
+
+    def test_reserved_flags_not_converted(self, monkeypatch):
+        rc, captured = self._run_call(
+            monkeypatch,
+            ["call", "test_tool", "--timeout-seconds=9", "--context=devops"],
+        )
+        assert rc == 0
+        assert captured["arguments"] == {"context": "devops"}
+
+    def test_direct_kv_merges_over_args_json(self, monkeypatch):
+        rc, captured = self._run_call(
+            monkeypatch,
+            ["call", "test_tool", "--args-json", '{"context": "prod", "extra": 1}', "--context=devops"],
+        )
+        assert rc == 0
+        assert captured["arguments"] == {"context": "devops", "extra": 1}
+
+    def test_direct_kv_with_args_mixed(self, monkeypatch):
+        rc, captured = self._run_call(
+            monkeypatch,
+            ["call", "test_tool", "--args", "a=1", "--b=2"],
+        )
+        assert rc == 0
+        assert captured["arguments"] == {"a": 1, "b": 2}
+
+    def test_direct_kv_stdin_marker(self, monkeypatch):
+        import io
+
+        import mcp2cli.cli as cli_mod
+
+        captured = {}
+
+        def fake_call(endpoint, tool_id, arguments, **kw):
+            captured["arguments"] = arguments
+            return "ok"
+
+        monkeypatch.setattr(cli_mod, "fetch_tool_list", lambda *a, **kw: [])
+        monkeypatch.setattr(cli_mod, "resolve_tool_id", lambda p, n: p)
+        monkeypatch.setattr(cli_mod, "call_tool", fake_call)
+        monkeypatch.setattr("sys.stdin", io.StringIO("my-pod"))
+
+        rc = main(["call", "test_tool", "--context=devops", "--name=@stdin"])
+        assert rc == 0
+        assert captured["arguments"] == {"context": "devops", "name": "my-pod"}
+
+
+class TestRewriteDirectKV:
+    """Pure tests for mcp2cli.cli._rewrite_direct_kv."""
+
+    def test_passthrough_other_subcommand(self):
+        from mcp2cli.cli import _rewrite_direct_kv
+
+        argv = ["list-tools", "k8s", "--weird=1"]
+        assert _rewrite_direct_kv(argv) == argv
+
+    def test_passthrough_no_args(self):
+        from mcp2cli.cli import _rewrite_direct_kv
+
+        assert _rewrite_direct_kv(["list-servers"]) == ["list-servers"]
+
+    def test_global_flags_before_call(self):
+        from mcp2cli.cli import _rewrite_direct_kv
+
+        argv = ["--cache-ttl-seconds", "30", "call", "t", "--context=devops"]
+        assert _rewrite_direct_kv(argv) == [
+            "--cache-ttl-seconds", "30", "call", "t", "--args", "context=devops",
+        ]
+
+    def test_reserved_flags_kept_with_values(self):
+        from mcp2cli.cli import _rewrite_direct_kv
+
+        argv = [
+            "call", "t", "--timeout-seconds", "9",
+            "--output-threshold-kb=50", "--args-json", "-", "--refresh",
+        ]
+        assert _rewrite_direct_kv(argv) == argv
+
+    def test_inline_reserved_flag_kept(self):
+        from mcp2cli.cli import _rewrite_direct_kv
+
+        argv = ["call", "t", "--timeout-seconds=9", "--context=devops"]
+        assert _rewrite_direct_kv(argv) == [
+            "call", "t", "--timeout-seconds=9", "--args", "context=devops",
+        ]
+
+    def test_stops_at_double_dash(self):
+        from mcp2cli.cli import _rewrite_direct_kv
+
+        argv = ["call", "t", "--", "--weird=1"]
+        assert _rewrite_direct_kv(argv) == argv
+
+    def test_value_with_equals_sign(self):
+        from mcp2cli.cli import _rewrite_direct_kv
+
+        assert _rewrite_direct_kv(["call", "t", "--token=a=b"]) == [
+            "call", "t", "--args", "token=a=b",
+        ]

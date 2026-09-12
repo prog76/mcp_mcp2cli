@@ -28,6 +28,7 @@ from mcp2cli.client import (
     DEFAULT_TOOL_TIMEOUT_SECONDS,
     _default_cache_dir,
     _default_workspace_dir,
+    _progress_enabled_from_env,
     _split_server_prefix,
     call_tool,
     fetch_prompt_list,
@@ -39,6 +40,93 @@ from mcp2cli.client import (
 )
 
 DEFAULT_MCP2CLI_BIN = "mcp2cli"
+
+# Flags consumed by the wrapper itself — never converted into tool arguments
+# by the direct ``--key=value`` shorthand.
+_RESERVED_FLAGS = {
+    # global parser options
+    "--mcp2cli-bin", "--endpoint", "--cache-dir", "--cache-ttl-seconds",
+    "--refresh", "--workspace-dir", "-h", "--help",
+    # ``call`` subcommand options
+    "--args", "--args-json", "--output-threshold-kb",
+    "--output-threshold-chars", "--timeout-seconds", "--no-progress",
+}
+# Reserved flags that take a separate value token when written as ``--flag value``.
+_RESERVED_VALUE_FLAGS = {
+    "--mcp2cli-bin", "--endpoint", "--cache-dir", "--cache-ttl-seconds",
+    "--workspace-dir", "--args", "--args-json", "--output-threshold-kb",
+    "--output-threshold-chars", "--timeout-seconds",
+}
+
+
+def _rewrite_direct_kv(argv: List[str]) -> List[str]:
+    """
+    Rewrite direct ``--key=value`` (and bare ``--key``) tokens belonging to
+    the ``call`` subcommand into ``--args key=value`` entries.
+
+    Lets callers pass tool arguments as plain flags::
+
+        mcp2cli call k8s_pods_get --context=devops --namespace=default
+        mcp2cli call k8s_pods_get --query.text=hello   # dotted keys work
+        mcp2cli call k8s_pods_get --verbose            # bare flag -> true
+
+    Rules:
+    - Only tokens after ``call`` are considered; everything before it and
+      other subcommands pass through untouched.
+    - Wrapper-owned flags (``_RESERVED_FLAGS``) pass through verbatim; when a
+      reserved value-flag is written as ``--flag value``, the value token is
+      kept together with it.
+    - A bare ``--key`` becomes ``key=true``. Everything after a standalone
+      ``--`` is left untouched (end-of-options marker).
+    """
+    out: List[str] = []
+    i = 0
+    n = len(argv)
+    in_call = False
+    while i < n:
+        tok = argv[i]
+        if tok in _RESERVED_VALUE_FLAGS and i + 1 < n:
+            # Keep reserved flag and its separate value token together.
+            out.append(tok)
+            out.append(argv[i + 1])
+            i += 2
+            continue
+        if tok in _RESERVED_FLAGS:
+            out.append(tok)
+            i += 1
+            continue
+        if not in_call:
+            if tok.startswith("-"):
+                out.append(tok)
+                i += 1
+                continue
+            # First positional token: the subcommand.
+            in_call = tok == "call"
+            out.append(tok)
+            i += 1
+            if not in_call:
+                out.extend(argv[i:])
+                break
+            continue
+        # Inside `call` from here on.
+        if tok == "--":
+            out.extend(argv[i:])
+            break
+        if tok.startswith("--"):
+            name, sep, inline_val = tok.partition("=")
+            if name in _RESERVED_FLAGS:
+                out.append(tok)
+                i += 1
+                continue
+            if sep:
+                out.extend(("--args", f"{name[2:]}={inline_val}"))
+            else:
+                out.extend(("--args", f"{name[2:]}=true"))
+            i += 1
+            continue
+        out.append(tok)
+        i += 1
+    return out
 
 
 def _set_dotted_key(root: dict, dotted_key: str, value: Any) -> None:
@@ -193,48 +281,48 @@ def cmd_call(args: argparse.Namespace) -> int:
         threshold = int(float(args.output_threshold_kb) * 1024)
     timeout_s = int(args.timeout_seconds)
 
-    # Parse tool args: either --args-json (raw JSON) OR --args (dotted key builder).
-    if args.args:
-        tool_args: Dict[str, Any] = {}
+    # Parse tool args: --args-json (raw JSON) forms the base, then --args and
+    # direct --key=value flags (dotted key builder) are applied on top of it.
+    tool_args: Dict[str, Any] = {}
+    try:
+        if args.args_json == "-":
+            stdin_raw = sys.stdin.read()
+            base: Dict[str, Any] = json.loads(stdin_raw) if stdin_raw.strip() else {}
+        else:
+            base = json.loads(args.args_json) if args.args_json else {}
+    except json.JSONDecodeError as e:
+        print(f"Invalid --args-json: {e.msg} (pos={e.pos}, line={getattr(e, 'lineno', None)})")
+        return 2
+    if not isinstance(base, dict):
+        print("--args-json must be a JSON object.")
+        return 2
+    tool_args.update(base)
+
+    for kv in args.args:
         try:
-            for kv in args.args:
-                if "=" not in kv:
-                    raise ValueError(f"Expected key=value, got: {kv}")
-                key, raw_val = kv.split("=", 1)
-                # Simple inline scalar parser — mcp_client_lib itself doesn't
-                # expose a standalone scalar parser, so we keep it local here.
-                v = raw_val.strip()
-                if v == "null":
-                    parsed: Any = None
-                elif v == "true":
-                    parsed = True
-                elif v == "false":
-                    parsed = False
-                else:
+            if "=" not in kv:
+                raise ValueError(f"Expected key=value, got: {kv}")
+            key, raw_val = kv.split("=", 1)
+            # Simple inline scalar parser — mcp_client_lib itself doesn't
+            # expose a standalone scalar parser, so we keep it local here.
+            v = raw_val.strip()
+            if v == "null":
+                parsed: Any = None
+            elif v == "true":
+                parsed = True
+            elif v == "false":
+                parsed = False
+            else:
+                try:
+                    parsed = int(v)
+                except Exception:
                     try:
-                        parsed = int(v)
+                        parsed = float(v)
                     except Exception:
-                        try:
-                            parsed = float(v)
-                        except Exception:
-                            parsed = v
-                _set_dotted_key(tool_args, key.strip(), parsed)
+                        parsed = v
+            _set_dotted_key(tool_args, key.strip(), parsed)
         except Exception as e:
             print(f"Invalid --args: {e}")
-            return 2
-    else:
-        # Parse args-json. We expect it to be a flat JSON object of tool parameters.
-        try:
-            if args.args_json == "-":
-                stdin_raw = sys.stdin.read()
-                tool_args = json.loads(stdin_raw) if stdin_raw.strip() else {}
-            else:
-                tool_args = json.loads(args.args_json) if args.args_json else {}
-        except json.JSONDecodeError as e:
-            print(f"Invalid --args-json: {e.msg} (pos={e.pos}, line={getattr(e, 'lineno', None)})")
-            return 2
-        if not isinstance(tool_args, dict):
-            print("--args-json must be a JSON object.")
             return 2
 
     # If stdin is piped (not a tty) and --args-json "-" was NOT used, slurp stdin
@@ -254,7 +342,7 @@ def cmd_call(args: argparse.Namespace) -> int:
                 continue
             key, raw_val = kv.split("=", 1)
             if raw_val.strip() == "@stdin":
-                tool_args[key.strip()] = stdin_content
+                _set_dotted_key(tool_args, key.strip(), stdin_content)
                 substituted = True
         if not substituted:
             tool_args["stdin"] = stdin_content
@@ -282,6 +370,7 @@ def cmd_call(args: argparse.Namespace) -> int:
         tool_id=resolved_tool_id,
         arguments=tool_args,
         timeout_seconds=timeout_s,
+        progress=not args.no_progress,
     )
 
     # Check for error marker in output
@@ -379,15 +468,45 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_desc.add_argument("tool_ids", help="Comma-separated tool ids")
     p_desc.set_defaults(func=cmd_describe)
 
-    p_call = sub.add_parser("call", help="Call a tool with --args-json")
+    p_call = sub.add_parser(
+        "call",
+        help="Call a tool with --args-json, --args, or direct --key=value flags",
+        epilog=(
+            "examples:\n"
+            "  mcp2cli call k8s_pods_get --context=devops --namespace=default\n"
+            "  mcp2cli call k8s_pods_get --query.text=hello --labels[]=x\n"
+            "  mcp2cli call k8s_pods_get --args context=devops --args name=@stdin <<< my-pod\n"
+            "  echo '{\"context\":\"devops\"}' | mcp2cli call k8s_pods_get --args-json -\n"
+            "\n"
+            "notes:\n"
+            "  - unknown --key=value flags become tool arguments; bare --key means\n"
+            "    --key=true; dotted keys and key[]=value arrays are supported\n"
+            "  - wrapper-owned flags (endpoint, cache, timeout, output-threshold,\n"
+            "    args, args-json) are never treated as tool arguments\n"
+            "  - --args-json builds the base; --args / direct keys override it\n"
+            "  - progress notifications are requested and printed to stderr by\n"
+            "    default ([HH:MM:SS] ⏳ tool: message); --timeout-seconds counts\n"
+            "    from the last progress notification (idle timeout), so tools\n"
+            "    that keep reporting are never killed; --no-progress turns both\n"
+            "    off (plain wall-clock timeout)"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     p_call.add_argument("tool_id", help="Tool name/id as shown by `list-tools`")
-    p_call.add_argument("--args-json", default="{}", help="JSON object of tool arguments")
+    p_call.add_argument(
+        "--args-json",
+        default="{}",
+        help="JSON object of tool arguments (base layer; --args / direct keys override it)",
+    )
     p_call.add_argument(
         "--args",
         action="append",
         default=[],
         metavar="key.subkey=value",
-        help="Build nested JSON on the wrapper side using dotted keys (repeatable).",
+        help=(
+            "Build nested JSON on the wrapper side using dotted keys (repeatable). "
+            "Direct --key=value flags are converted to this automatically."
+        ),
     )
     p_call.add_argument(
         "--output-threshold-kb",
@@ -399,7 +518,26 @@ def main(argv: Optional[List[str]] = None) -> int:
         type=int,
         default=int(os.environ.get("MCP2CLI_OUTPUT_THRESHOLD_CHARS", DEFAULT_OUTPUT_THRESHOLD_CHARS)),
     )
-    p_call.add_argument("--timeout-seconds", type=int, default=DEFAULT_TOOL_TIMEOUT_SECONDS)
+    p_call.add_argument(
+        "--timeout-seconds",
+        type=int,
+        default=DEFAULT_TOOL_TIMEOUT_SECONDS,
+        help=(
+            "Idle timeout: give up after this many seconds WITHOUT progress "
+            "(default 120). Progress notifications (requested by default) reset "
+            "the countdown, so tools that keep reporting are never killed."
+        ),
+    )
+    p_call.add_argument(
+        "--no-progress",
+        action="store_true",
+        default=not _progress_enabled_from_env(),
+        help=(
+            "Do not request/print progress notifications. With progress on, "
+            "--timeout-seconds counts from the last progress notification "
+            "(idle timeout); with it off, it is a plain wall-clock timeout."
+        ),
+    )
     p_call.set_defaults(func=cmd_call)
 
     p_list_prompts = sub.add_parser("list-prompts", help="List prompts available on the endpoint")
@@ -419,7 +557,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     p_get_prompt.set_defaults(func=cmd_get_prompt)
 
-    args = parser.parse_args(argv)
+    argv = sys.argv[1:] if argv is None else list(argv)
+    args = parser.parse_args(_rewrite_direct_kv(argv))
     return int(args.func(args) or 0)
 
 

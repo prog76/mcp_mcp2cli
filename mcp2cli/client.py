@@ -14,6 +14,7 @@ Used by:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -275,6 +276,111 @@ async def _call_tool_live(
                                      progress_callback=progress_callback)
 
 
+# ---------------------------------------------------------------------------
+# Progress reporting + progress-aware (idle) timeout
+# ---------------------------------------------------------------------------
+
+# Sync callback invoked for every notifications/progress received:
+# (progress, total, message).
+ProgressReporter = Callable[[float, Optional[float], Optional[str]], None]
+
+
+def _progress_enabled_from_env(default: bool = True) -> bool:
+    """Whether progress notifications should be requested/printed.
+
+    On by default (used by the CLI ``call`` subcommand);
+    ``MCP2CLI_PROGRESS=0`` (or false/no/off) disables it.
+    """
+    raw = os.environ.get("MCP2CLI_PROGRESS", "").strip().lower()
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _stderr_progress_reporter(tool_id: str) -> ProgressReporter:
+    """Build a reporter that prints each progress notification to stderr."""
+
+    def _report(progress: float, total: Optional[float], message: Optional[str]) -> None:
+        try:
+            ts = time.strftime("%H:%M:%S")
+            text = (message or "").strip()
+            if not text:
+                text = f"progress={progress}" + (f"/{total}" if total else "")
+            print(f"[{ts}] \u23f3 {tool_id}: {text}", file=sys.stderr, flush=True)
+        except Exception:
+            pass
+
+    return _report
+
+
+def _resolve_progress_reporter(
+    tool_id: str,
+    progress: Optional[bool],
+    on_progress: Optional[ProgressReporter],
+) -> Optional[ProgressReporter]:
+    """Pick the progress reporter for a call (an explicit callback wins)."""
+    if on_progress is not None:
+        return on_progress
+    enabled = _progress_enabled_from_env() if progress is None else bool(progress)
+    return _stderr_progress_reporter(tool_id) if enabled else None
+
+
+async def _call_tool_live_progress_timed(
+    endpoint: str,
+    tool_id: str,
+    arguments: Dict[str, Any],
+    timeout_seconds: int = DEFAULT_TOOL_TIMEOUT_SECONDS,
+    on_progress: Optional[ProgressReporter] = None,
+) -> Any:
+    """``_call_tool_live`` wrapped in a progress-aware (idle) timeout.
+
+    The deadline is ``timeout_seconds`` counted from the *last* progress
+    notification (or from the start when none has arrived yet). Every incoming
+    ``notifications/progress`` re-arms the timer, so a long-running tool that
+    keeps reporting (e.g. a skills playbook with keep-alive beats) is never
+    killed, while a tool that goes silent for ``timeout_seconds`` is bounded
+    as before. With no progressToken in play (progress reporting disabled)
+    this degrades to the plain wall-clock timeout.
+    """
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    state = {"last_activity": started}
+
+    async def _progress_cb(progress: float, total: Optional[float], message: Optional[str]) -> None:
+        # Runs inside the SDK's receive-loop task: keep it cheap — record the
+        # beat (re-arms the idle deadline) and let the sync reporter do I/O.
+        state["last_activity"] = loop.time()
+        if on_progress is not None:
+            try:
+                on_progress(progress, total, message)
+            except Exception:
+                pass
+
+    call_task = asyncio.ensure_future(
+        _call_tool_live(endpoint, tool_id, arguments, progress_callback=_progress_cb)
+    )
+    try:
+        while True:
+            remaining = (state["last_activity"] + timeout_seconds) - loop.time()
+            if remaining <= 0:
+                total_elapsed = loop.time() - started
+                raise TimeoutError(
+                    f"no progress for {timeout_seconds}s "
+                    f"(idle timeout; total elapsed {total_elapsed:.0f}s)"
+                )
+            done, _pending = await asyncio.wait({call_task}, timeout=remaining)
+            if call_task in done:
+                return call_task.result()
+            # This round hit the deadline, but a progress callback may have
+            # re-armed it meanwhile — loop and recompute instead of giving up.
+    except BaseException:
+        if not call_task.done():
+            call_task.cancel()
+        with contextlib.suppress(BaseException):
+            await call_task
+        raise
+
+
 def _flatten_exception(exc: BaseException) -> str:
     """Best-effort extract a readable message from an exception.
 
@@ -340,14 +446,18 @@ def _format_tool_result(out_obj: Any) -> str:
 
 def _format_tool_call_error(tool_id: str, endpoint: str, timeout_seconds: int, exc: BaseException) -> str:
     if isinstance(exc, asyncio.TimeoutError):
+        # The idle-timer wrapper raises TimeoutError with a detail message
+        # ("no progress for Ns ..."); a plain wall-clock one carries none.
+        detail = str(exc).strip()
         log.warning(
-            "Tool call timed out: tool=%s endpoint=%s timeout_seconds=%s",
+            "Tool call timed out: tool=%s endpoint=%s timeout_seconds=%s (%s)",
             tool_id,
             endpoint,
             timeout_seconds,
+            detail or "wall-clock",
         )
         return (
-            f"Error calling tool '{tool_id}': timed out after {timeout_seconds}s "
+            f"Error calling tool '{tool_id}': {detail or f'timed out after {timeout_seconds}s'} "
             f"(wait timeout — not a transport failure; do not assume the command failed or re-run "
             f"mutating commands; check status / use terminal_wait if applicable)"
         )
@@ -366,13 +476,31 @@ async def call_tool_async(
     arguments: Dict[str, Any],
     timeout_seconds: int = DEFAULT_TOOL_TIMEOUT_SECONDS,
     stdin: Optional[str] = None,
+    progress: Optional[bool] = None,
+    on_progress: Optional[ProgressReporter] = None,
 ) -> str:
+    """Call a tool (async). ``timeout_seconds`` is an *idle* timeout: it is
+    counted from the last progress notification, so a tool that keeps
+    reporting progress (e.g. a long-running skills playbook) is never killed,
+    while a silent one is bounded as before.
+
+    Progress notifications are requested and (unless ``on_progress`` is given)
+    printed to stderr when ``progress`` is true (default: enabled unless
+    ``MCP2CLI_PROGRESS=0``). Disable with ``progress=False``/``--no-progress``
+    — the timeout then becomes plain wall-clock.
+    """
     call_args = dict(arguments) if arguments else {}
     if stdin is not None:
         call_args["stdin"] = stdin
 
     try:
-        out_obj = await asyncio.wait_for(_call_tool_live(endpoint, tool_id, call_args), timeout=timeout_seconds)
+        out_obj = await _call_tool_live_progress_timed(
+            endpoint,
+            tool_id,
+            call_args,
+            timeout_seconds=timeout_seconds,
+            on_progress=_resolve_progress_reporter(tool_id, progress, on_progress),
+        )
         return _format_tool_result(out_obj)
     except Exception as e:
         return _format_tool_call_error(tool_id, endpoint, timeout_seconds, e)
@@ -384,14 +512,26 @@ def call_tool(
     arguments: Dict[str, Any],
     timeout_seconds: int = DEFAULT_TOOL_TIMEOUT_SECONDS,
     stdin: Optional[str] = None,
+    progress: Optional[bool] = None,
+    on_progress: Optional[ProgressReporter] = None,
 ) -> str:
+    """Sync wrapper around :func:`call_tool_async` (same idle-timeout semantics).
+
+    See :func:`call_tool_async` for the ``progress``/``on_progress`` options.
+    """
     call_args = dict(arguments) if arguments else {}
     if stdin is not None:
         call_args["stdin"] = stdin
 
     try:
         out_obj = asyncio.run(
-            asyncio.wait_for(_call_tool_live(endpoint, tool_id, call_args), timeout=timeout_seconds)
+            _call_tool_live_progress_timed(
+                endpoint,
+                tool_id,
+                call_args,
+                timeout_seconds=timeout_seconds,
+                on_progress=_resolve_progress_reporter(tool_id, progress, on_progress),
+            )
         )
         return _format_tool_result(out_obj)
     except Exception as e:

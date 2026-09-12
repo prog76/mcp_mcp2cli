@@ -36,7 +36,31 @@ strip `outputSchema`, so `describe` there omits `output` — controlled by
 ```bash
 mcp2cli call query_prometheus --args expr=up --args datasourceUid=<uid>
 mcp2cli call query_prometheus --args-json '{"expr":"up"}' --args-json -
+mcp2cli call query_prometheus --expr=up --datasourceUid=<uid>
+mcp2cli call query_prometheus --verbose            # bare flag -> {"verbose": true}
 ```
+
+Direct `--key=value` flags are rewritten to `--args` automatically (dotted keys
+and `key[]=value` arrays work). `--args-json` forms the base arguments object;
+`--args` and direct keys are applied on top of it and override its values.
+Wrapper-owned flags (`--endpoint`, `--timeout-seconds`, `--output-threshold-*`,
+`--args`, `--args-json`) are never treated as tool arguments.
+
+### Progress reporting (on by default)
+`mcp2cli call` requests MCP progress notifications and prints every one to
+stderr as `[HH:MM:SS] ⏳ <tool>: <message>`:
+
+```text
+$ mcp2cli call skills_ipybox_run_skill --args-json '{"skill":"k8s-memory-dump","args":{...}}'
+[10:02:11] ⏳ skills_ipybox_run_skill: creating debug container memdump-debug (12s)
+[10:02:21] ⏳ skills_ipybox_run_skill: collecting gcdump from pid 1 (22s)
+```
+
+`--timeout-seconds` (default 120) is an **idle** timeout: the countdown restarts
+on every progress notification, so a tool that keeps reporting progress is
+never killed no matter how long it runs, while a tool that goes silent for the
+full period still times out. Disable with `--no-progress` or
+`MCP2CLI_PROGRESS=0` — the timeout then becomes plain wall-clock.
 
 ### List prompts
 ```bash
@@ -63,6 +87,9 @@ cat file | mcp2cli call vscode_terminal_exec \
 - `MCP2CLI_CACHE_DIR` — tool-list cache directory
 - `MCP2CLI_CACHE_TTL` — cache TTL in seconds
 - `MCP2CLI_WORKSPACE_DIR` — where large outputs are saved
+- `MCP2CLI_PROGRESS` — set to `0` to disable progress reporting (default on)
+- `MCP_TOOL_TIMEOUT_SECONDS` — default call timeout in seconds (default 120;
+  counts from the last progress notification, see above)
 
 ## How it works
 `mcp2cli` discovers tools and calls the policy-proxy MCP endpoint directly
