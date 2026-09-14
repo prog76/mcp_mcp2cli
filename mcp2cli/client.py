@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -76,6 +77,46 @@ def _split_server_prefix(tool_id: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# MCP session reuse cache
+# ---------------------------------------------------------------------------
+# Reuses the same Mcp-Session-Id across multiple calls to the same endpoint
+# within one process. This makes the gateway's session-scoped confirm bypass
+# ("Allow 10 min (session)") cover every call from a single client session
+# (e.g. one ipybox kernel) instead of requiring per-call approval — because
+# without reuse, every mcp_call() initializes a fresh session with a new id.
+#
+# Keyed by endpoint URL -> Mcp-Session-Id. Lives in process memory and dies
+# naturally with the process (no explicit cleanup needed). A threading.Lock
+# guards get-or-init because ipybox kernels run concurrent work in threads
+# (background jobs, async prompt helpers via _sync()'s worker threads).
+#
+# Server-side session expiry / gateway restart surfaces as HTTP 404
+# ("Invalid or expired session ID"); callers invalidate the cache and retry
+# once with a fresh session on that condition.
+
+_session_cache: Dict[str, str] = {}
+_session_cache_lock = threading.Lock()
+
+
+def _get_cached_session_id(endpoint: str) -> Optional[str]:
+    """Return cached Mcp-Session-Id for endpoint, or None."""
+    with _session_cache_lock:
+        return _session_cache.get(endpoint)
+
+
+def _set_cached_session_id(endpoint: str, session_id: str) -> None:
+    """Cache Mcp-Session-Id for endpoint."""
+    with _session_cache_lock:
+        _session_cache[endpoint] = session_id
+
+
+def _invalidate_cached_session_id(endpoint: str) -> None:
+    """Drop cached session for endpoint (e.g. after a 404)."""
+    with _session_cache_lock:
+        _session_cache.pop(endpoint, None)
+
+
+# ---------------------------------------------------------------------------
 # Caching
 # ---------------------------------------------------------------------------
 
@@ -120,6 +161,57 @@ def save_cache(cache_dir: Path, endpoint: str, tools: List[Dict[str, Any]]) -> N
 # Live fetching
 # ---------------------------------------------------------------------------
 
+
+async def _initialize_session(
+    c: httpx.AsyncClient,
+    endpoint: str,
+    hdrs: Dict[str, str],
+) -> str:
+    """Initialize a new MCP session, set the session id header, cache it,
+    and return the session id (empty string on unexpected failure)."""
+    init_req = {
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "mcp2cli", "version": "0.1"},
+        },
+        "jsonrpc": "2.0",
+        "id": 1,
+    }
+    resp = await c.post(endpoint, json=init_req, headers=hdrs)
+    resp.raise_for_status()
+
+    session_id = resp.headers.get("mcp-session-id", "")
+    if session_id:
+        hdrs["Mcp-Session-Id"] = session_id
+        _set_cached_session_id(endpoint, session_id)
+
+    init_data = _parse_response(resp)
+    if "error" in init_data:
+        raise RuntimeError(f"Initialize failed: {init_data['error']}")
+
+    return session_id
+
+
+async def _ensure_session(
+    c: httpx.AsyncClient,
+    endpoint: str,
+    hdrs: Dict[str, str],
+) -> str:
+    """Return an active Mcp-Session-Id for endpoint, using the cache when valid.
+
+    If a cached session id exists it is applied to hdrs without re-initializing.
+    Otherwise a new session is initialized and cached. Returns the session id
+    (may be empty if the server does not assign one)."""
+    cached = _get_cached_session_id(endpoint)
+    if cached:
+        hdrs["Mcp-Session-Id"] = cached
+        return cached
+
+    return await _initialize_session(c, endpoint, hdrs)
+
+
 async def _fetch_tool_list_unbounded(endpoint: str) -> List[Dict[str, Any]]:
     """Raw, unbounded tool-list fetch.
 
@@ -131,39 +223,29 @@ async def _fetch_tool_list_unbounded(endpoint: str) -> List[Dict[str, Any]]:
         "Content-Type": "application/json",
     }
     async with httpx.AsyncClient(timeout=120, follow_redirects=True) as c:
-        # Initialize the session
-        init_req = {
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2025-03-26",
-                "capabilities": {},
-                "clientInfo": {"name": "mcp2cli", "version": "0.1"},
-            },
-            "jsonrpc": "2.0",
-            "id": 1,
-        }
-        resp = await c.post(endpoint, json=init_req, headers=hdrs)
-        resp.raise_for_status()
+        # Ensure a cached session (reuses Mcp-Session-Id across calls)
+        await _ensure_session(c, endpoint, hdrs)
 
-        # Extract session ID from response headers
-        session_id = resp.headers.get("mcp-session-id", "")
-        if session_id:
-            hdrs["Mcp-Session-Id"] = session_id
-
-        # Parse initialize response to check for errors
-        init_data = _parse_response(resp)
-        if "error" in init_data:
-            raise RuntimeError(f"Initialize failed: {init_data['error']}")
-
-        # List tools with session ID
+        # List tools with session ID, retry once on stale session (404)
         list_req = {
             "method": "tools/list",
             "params": {},
             "jsonrpc": "2.0",
             "id": 2,
         }
-        resp2 = await c.post(endpoint, json=list_req, headers=hdrs)
-        resp2.raise_for_status()
+        try:
+            resp2 = await c.post(endpoint, json=list_req, headers=hdrs)
+            resp2.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404 and _get_cached_session_id(endpoint):
+                log.info("Stale MCP session for %s, re-initializing", endpoint)
+                _invalidate_cached_session_id(endpoint)
+                hdrs.pop("Mcp-Session-Id", None)
+                await _ensure_session(c, endpoint, hdrs)
+                resp2 = await c.post(endpoint, json=list_req, headers=hdrs)
+                resp2.raise_for_status()
+            else:
+                raise
 
         result = _parse_response(resp2)
         if "error" in result:
@@ -297,7 +379,13 @@ async def _call_tool_live(
     arguments: Dict[str, Any],
     progress_callback: Optional[Callable[[float, Optional[float], Optional[str]], Awaitable[None]]] = None,
 ) -> Any:
-    """Call a tool via streamable HTTP with proper session ID handling.
+    """Call a tool via streamable HTTP with session reuse.
+
+    Reuses the same Mcp-Session-Id across calls to the same endpoint so the
+    gateway's session-scoped confirm bypass ("Allow 10 min (session)") covers
+    every call from one client session. On a stale/expired session (HTTP 404
+    "Invalid or expired session ID" from the MCP SDK streamable-HTTP server)
+    the cache is invalidated and the call is retried once with a fresh session.
 
     The MCP SDK v1.30.0 has a bug where it doesn't always resend the
     Mcp-Session-Id header on subsequent requests after initialize().
@@ -309,31 +397,10 @@ async def _call_tool_live(
         "Content-Type": "application/json",
     }
     async with httpx.AsyncClient(timeout=120, follow_redirects=True) as c:
-        # Initialize the session
-        init_req = {
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2025-03-26",
-                "capabilities": {},
-                "clientInfo": {"name": "mcp2cli", "version": "0.1"},
-            },
-            "jsonrpc": "2.0",
-            "id": 1,
-        }
-        resp = await c.post(endpoint, json=init_req, headers=hdrs)
-        resp.raise_for_status()
+        # Ensure a cached session (reuses Mcp-Session-Id across calls)
+        await _ensure_session(c, endpoint, hdrs)
 
-        # Extract session ID from response headers
-        session_id = resp.headers.get("mcp-session-id", "")
-        if session_id:
-            hdrs["Mcp-Session-Id"] = session_id
-
-        # Parse initialize response to check for errors
-        init_data = _parse_response(resp)
-        if "error" in init_data:
-            raise RuntimeError(f"Initialize failed: {init_data['error']}")
-
-        # Call the tool with session ID
+        # Call the tool with session ID, retry once on stale session (404)
         call_req = {
             "method": "tools/call",
             "params": {"name": tool_id, "arguments": arguments},
@@ -345,8 +412,19 @@ async def _call_tool_live(
         if progress_callback is not None:
             call_req["params"]["_meta"] = {"progressToken": str(uuid.uuid4())}
 
-        resp2 = await c.post(endpoint, json=call_req, headers=hdrs)
-        resp2.raise_for_status()
+        try:
+            resp2 = await c.post(endpoint, json=call_req, headers=hdrs)
+            resp2.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404 and _get_cached_session_id(endpoint):
+                log.info("Stale MCP session for %s, re-initializing", endpoint)
+                _invalidate_cached_session_id(endpoint)
+                hdrs.pop("Mcp-Session-Id", None)
+                await _ensure_session(c, endpoint, hdrs)
+                resp2 = await c.post(endpoint, json=call_req, headers=hdrs)
+                resp2.raise_for_status()
+            else:
+                raise
 
         result = _parse_response(resp2, progress_callback=progress_callback)
         if "error" in result:
