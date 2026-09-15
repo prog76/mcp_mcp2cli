@@ -389,13 +389,22 @@ async def _call_tool_live(
 
     The MCP SDK v1.30.0 has a bug where it doesn't always resend the
     Mcp-Session-Id header on subsequent requests after initialize().
-    This implementation uses raw HTTP (like skill_runner.py) to ensure
+        This implementation uses raw HTTP (like skill_runner.py) to ensure
     the session header is always included.
     """
     hdrs = {
         "Accept": "application/json, text/event-stream",
         "Content-Type": "application/json",
     }
+    # Forward the kernel's stable operator session (MCP_SESSION_ID, injected by
+    # the gateway policy from the operator's inbound Mcp-Session-Id) under a
+    # dedicated header. The gateway keys its per-session confirm bypass
+    # ("Allow 10 min (session)") on this value so the grant survives ipybox
+    # kernel idle-reaps — the kernel-local mcp2cli Mcp-Session-Id is re-created
+    # on every reap and would otherwise force a fresh approval each time.
+    _op_session = os.environ.get("MCP_SESSION_ID")
+    if _op_session:
+        hdrs["X-MCP-Operator-Session"] = _op_session
     async with httpx.AsyncClient(timeout=120, follow_redirects=True) as c:
         # Ensure a cached session (reuses Mcp-Session-Id across calls)
         await _ensure_session(c, endpoint, hdrs)
