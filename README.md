@@ -82,6 +82,65 @@ cat file | mcp2cli call vscode_terminal_exec \
   --args stdin='@stdin'
 ```
 
+## OAuth-protected endpoints
+
+An endpoint can answer 401 with an RFC 9728 challenge
+(`WWW-Authenticate: Bearer resource_metadata="..."`). mcp2cli never logs in on
+its own; it only uses a grant you minted, and tells you when it is missing one:
+
+```text
+$ mcp2cli --endpoint https://host/servers/<id>/mcp list-servers
+https://host/servers/<id>/mcp requires an OAuth bearer token.
+  Mint one with:  mcp2cli auth login --endpoint https://host/servers/<id>/mcp
+  Inspect it with: mcp2cli auth status --endpoint https://host/servers/<id>/mcp
+$ echo $?
+2
+```
+
+Mint the grant:
+
+```bash
+export MCP2CLI_OAUTH_CLIENT_ID=<client-id>
+mcp2cli auth login --endpoint https://host/servers/<id>/mcp
+```
+
+`login` prints the authorization URL on stdout and then waits on a loopback
+listener for the browser redirect (RFC 8252) - progress goes to stderr. **Run it
+where the browser is**: the redirect URI is `http://localhost:<port>`, so a
+listener inside a container or a remote shell will not see the callback. It
+must be completed by a human; there is no device-code fallback here because
+not every IdP enables that grant for every client.
+
+```bash
+mcp2cli auth status --endpoint <ep>   # what is stored, and for how long
+mcp2cli auth logout --endpoint <ep>   # forget it
+```
+
+Afterwards every subcommand uses the stored token and refreshes it when it has
+expired. Grants live one per endpoint in `~/.cache/mcp2cli/oauth` (directory
+`0700`, file `0600`), keyed by endpoint so two endpoints never share a token.
+
+Notes:
+- The flow is PKCE with a public client: no client secret is involved, and no
+  attempt is made to register a client automatically (internal IdPs commonly
+  disable dynamic registration, and a self-registered client would not be
+  authorised anyway).
+- The port is ephemeral by default. Use `--redirect-port` only when the IdP has
+a pre-registered redirect URI; an already-occupied fixed port is a common
+  failure on a busy host.
+- The token request carries an RFC 8707 `resource` parameter, so the grant is
+  audience-bound to the endpoint it was minted for.
+
+### OAuth environment variables
+- `MCP2CLI_OAUTH_CLIENT_ID`      - OAuth client id (required)
+- `MCP2CLI_OAUTH_SCOPES`         - scopes, space- or comma-separated
+                                   (default: the resource's, else `openid profile email`)
+- `MCP2CLI_OAUTH_REDIRECT_HOST`  - loopback callback host (default `localhost`)
+- `MCP2CLI_OAUTH_REDIRECT_PORT`  - loopback callback port, `0` = ephemeral (default)
+- `MCP2CLI_OAUTH_CALLBACK_PATH`  - loopback callback path (default `/callback`)
+- `MCP2CLI_OAUTH_LOGIN_TIMEOUT`  - seconds to wait for the browser (default 300)
+- `MCP2CLI_OAUTH_CACHE_DIR`      - where grants are stored (default `~/.cache/mcp2cli/oauth`)
+
 ## Environment variables (optional)
 - `MCP_ENDPOINT` — target MCP URL (default `http://localhost:8000/mcp/full`)
 - `MCP2CLI_CACHE_DIR` — tool-list cache directory
@@ -101,3 +160,6 @@ untrusted client.
 - `mcp2cli.client` — reusable client library (no argparse): fetching, calling,
   caching, output threshold, tool-id resolution.
 - `mcp2cli.cli`      — the `mcp2cli` command entry point.
+- `mcp2cli.auth`     — OAuth discovery, the loopback login flow, and the
+  per-endpoint grant store. Used by `client` to attach a bearer; knows nothing
+  about tool calling.
