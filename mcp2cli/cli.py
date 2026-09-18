@@ -21,6 +21,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from mcp2cli.auth import AuthChallenge
 from mcp2cli.client import (
     DEFAULT_ENDPOINT,
     DEFAULT_CACHE_TTL_SECONDS,
@@ -706,7 +707,13 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     argv = sys.argv[1:] if argv is None else list(argv)
     args = parser.parse_args(_rewrite_direct_kv(argv))
-    return int(args.func(args) or 0)
+    try:
+        return int(args.func(args) or 0)
+    except AuthChallenge as e:
+        # Exit 2: the endpoint needs an OAuth grant. The message already names
+        # the command to run; print it bare so scripts can rely on the code.
+        print(e, file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

@@ -31,9 +31,10 @@ class ToolFake:
 class _FakeResponse:
     """Fake httpx.Response that returns tool data."""
 
-    def __init__(self, data, content_type="application/json"):
+    def __init__(self, data, content_type="application/json", status_code=200):
         self._data = data
         self._content_type = content_type
+        self.status_code = status_code
 
     def raise_for_status(self):
         pass

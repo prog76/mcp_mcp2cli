@@ -217,8 +217,14 @@ async def _initialize_session(
         "jsonrpc": "2.0",
         "id": 1,
     }
+    from mcp2cli import auth
+
     _attach_auth(endpoint, hdrs)
     resp = await c.post(endpoint, json=init_req, headers=hdrs)
+    if resp.status_code in (401, 403):
+        hint = _auth_hint(resp, endpoint)
+        if hint:
+            raise auth.AuthChallenge(hint)
     resp.raise_for_status()
 
     session_id = resp.headers.get("mcp-session-id", "")
@@ -284,7 +290,7 @@ async def _fetch_tool_list_unbounded(endpoint: str) -> List[Dict[str, Any]]:
             elif e.response.status_code in (401, 403):
                 hint = _auth_hint(e.response, endpoint)
                 if hint:
-                    raise RuntimeError(hint) from e
+                    raise auth.AuthChallenge(hint) from e
                 raise
             else:
                 raise
@@ -475,7 +481,7 @@ async def _call_tool_live(
             elif e.response.status_code in (401, 403):
                 hint = _auth_hint(e.response, endpoint)
                 if hint:
-                    raise RuntimeError(hint) from e
+                    raise auth.AuthChallenge(hint) from e
                 raise
             else:
                 raise

@@ -89,7 +89,7 @@ class FakeIdP:
 
             def do_GET(self):  # noqa: N802
                 parsed = urllib.parse.urlparse(self.path)
-                idp.requests.append(("GET", self.path, dict(self.headers)))
+                idp.requests.append(("GET", self.path, self._header_view, {}))
                 if parsed.path == RESOURCE_PATH:
                     self._challenge()
                     return
@@ -119,7 +119,7 @@ class FakeIdP:
                 length = int(self.headers.get("Content-Length") or 0)
                 raw = self.rfile.read(length).decode()
                 form = dict(urllib.parse.parse_qsl(raw))
-                idp.requests.append(("POST", self.path, form))
+                idp.requests.append(("POST", self.path, self._header_view, form))
                 if parsed.path == RESOURCE_PATH:
                     self._challenge()
                     return
@@ -128,8 +128,18 @@ class FakeIdP:
                     return
                 self._send(404, {"error": "not_found"})
 
+            @property
+            def _header_view(self):
+                """Request headers as {lowercase_name: value}, as recorded."""
+                return {k.lower(): v for k, v in self.headers.items()}
+
+            @property
+            def _authorized(self):
+                """True when the request carries the access token we issued."""
+                return self.headers.get("Authorization") == f"Bearer {idp.access_token}"
+
             def _challenge(self):
-                if not idp.require_bearer:
+                if not idp.require_bearer or self._authorized:
                     self._send(200, {"jsonrpc": "2.0", "id": 1, "result": {}})
                     return
                 self._send(
@@ -448,9 +458,9 @@ def test_login_sends_pkce_and_no_client_secret(idp, store):
         store=store,
     )
     exchange = [r for r in idp.requests if r[0] == "POST" and r[1] == "/token"][0]
-    assert exchange[2]["client_id"] == "c"
-    assert "client_secret" not in exchange[2]
-    assert exchange[2]["redirect_uri"].startswith("http://localhost:")
+    assert exchange[3]["client_id"] == "c"
+    assert "client_secret" not in exchange[3]
+    assert exchange[3]["redirect_uri"].startswith("http://localhost:")
     assert idp.seen_verifier
 
 
@@ -599,3 +609,57 @@ def test_status_reports_grant(idp, store):
     assert body["scopes"] == ["openid", "profile", "email"]
     assert body["expires_in"] > 0
     assert body["refresh_expires_in"] > 0
+
+
+# -- integration with the client's request path -------------------------------
+
+
+def test_client_sends_bearer_and_lists_tools(idp, store, monkeypatch):
+    """With a grant stored, the client authenticates for real.
+
+    This is the end-to-end claim: login writes a grant, and the next tool-list
+    call carries it and gets past the 401 challenge instead of hinting.
+    """
+    monkeypatch.setenv("MCP2CLI_OAUTH_CACHE_DIR", str(store.dir))
+    auth.login(
+        idp.resource,
+        config=auth.load_config({"client_id": "c"}),
+        announce=lambda prompt: _play_browser(prompt, idp),
+        store=store,
+    )
+
+    from mcp2cli import client as c
+
+    c._session_cache.clear()
+    idp.require_bearer = True
+    tools = c.fetch_tool_list(idp.resource, store.dir / "tools", 3600)
+    assert tools == []
+    sent = [r for r in idp.requests if r[0] == "POST" and r[1] == RESOURCE_PATH]
+    assert sent, "the resource should have been called"
+    headers = sent[-1][2]
+    assert headers.get("authorization") == "Bearer access-1", (
+        f"the initialize POST must carry the stored bearer; got {headers}"
+    )
+
+
+def test_client_raises_auth_challenge_without_grant(idp, store, monkeypatch):
+    """No grant: the client raises the actionable challenge, not a 401 traceback."""
+    monkeypatch.setenv("MCP2CLI_OAUTH_CACHE_DIR", str(store.dir))
+
+    from mcp2cli import client as c
+
+    c._session_cache.clear()
+    with pytest.raises(auth.AuthChallenge, match="auth login"):
+        c.fetch_tool_list(idp.resource, store.dir / "tools", 3600)
+
+
+def test_auth_challenge_is_catchable_by_the_cli(idp, store, monkeypatch):
+    """The CLI turns an AuthChallenge into exit code 2 and a two-line message."""
+    monkeypatch.setenv("MCP2CLI_OAUTH_CACHE_DIR", str(store.dir))
+
+    from mcp2cli import cli
+
+    code = cli.main(
+        ["--endpoint", idp.resource, "--cache-dir", str(store.dir / "tools"), "list-servers"]
+    )
+    assert code == 2

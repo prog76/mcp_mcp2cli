@@ -61,6 +61,14 @@ class OAuthError(RuntimeError):
     """An OAuth lane could not produce a usable bearer token."""
 
 
+class AuthChallenge(RuntimeError):
+    """The endpoint demanded a bearer token and none is stored.
+
+    Carries the operator-facing hint as its message; the CLI catches it and
+    exits with status 2 so scripts can tell 'needs a login' from other errors.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
