@@ -663,3 +663,60 @@ def test_auth_challenge_is_catchable_by_the_cli(idp, store, monkeypatch):
         ["--endpoint", idp.resource, "--cache-dir", str(store.dir / "tools"), "list-servers"]
     )
     assert code == 2
+
+
+# -- the callback listener must never wedge on a held connection ----------------
+
+
+def test_callback_listener_releases_connection_and_serves_another_client():
+    """A browser holding its socket must not block a second client.
+
+    Observed for real: the browser got the success page and kept the connection
+    open. The listener was single-threaded and, without Connection: close, its
+    one handler parked in readline on that socket - so the operator's follow-up
+    request (a fresh connection) was accepted by the backlog and never answered.
+    The login then appeared to hang even though the code had arrived.
+    """
+    import socket
+    import time
+
+    listener = auth.CallbackListener("127.0.0.1", 0, "/callback")
+    port = listener.port
+    path = "/callback?code=abc&state=st"
+
+    def raw_request():
+        sock = socket.create_connection(("127.0.0.1", port), timeout=4)
+        sock.sendall(
+            f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept: */*\r\n\r\n".encode()
+        )
+        return sock, sock.recv(200)
+
+    try:
+        # The browser: gets its answer and holds the socket open.
+        sock_a, reply_a = raw_request()
+        assert b"200 OK" in reply_a
+        time.sleep(0.2)
+
+        # A second, fresh client must still be served.
+        sock_b, reply_b = raw_request()
+        assert b"200 OK" in reply_b
+        sock_b.close()
+        sock_a.close()
+
+        assert listener.wait(5)["code"] == "abc"
+    finally:
+        listener.close()
+
+
+def test_callback_listener_still_captures_on_repeat_requests():
+    """Re-pasting the callback URL must not upset the flow."""
+    import httpx
+
+    listener = auth.CallbackListener("127.0.0.1", 0, "/callback")
+    try:
+        url = f"http://127.0.0.1:{listener.port}/callback?code=abc&state=st"
+        assert httpx.get(url, timeout=5).status_code == 200
+        assert httpx.get(url, timeout=5).status_code == 200
+        assert listener.wait(5) == {"code": "abc", "state": "st"}
+    finally:
+        listener.close()

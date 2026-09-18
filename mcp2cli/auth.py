@@ -40,7 +40,7 @@ import time
 import urllib.parse
 import webbrowser
 from dataclasses import asdict, dataclass, field
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
@@ -378,9 +378,12 @@ class CallbackListener:
         self._params: Optional[Dict[str, str]] = None
         self._event = threading.Event()
         try:
-            self._server = HTTPServer((host, port), self._build_handler())
+            # Threading, not single-threaded: one held connection must never be
+            # able to block the only handler thread while the flow waits.
+            self._server = ThreadingHTTPServer((host, port), self._build_handler())
         except OSError as exc:
             raise OAuthError(f"cannot listen on {host}:{port}: {exc}") from exc
+        self._server.daemon_threads = True
         self.port: int = self._server.server_address[1]
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
@@ -390,6 +393,10 @@ class CallbackListener:
 
         class _Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
+            # Bound every socket wait. An idle keep-alive connection then
+            # releases its thread instead of holding it until the process
+            # exits, and shutdown() can never wait forever on such a handler.
+            timeout = 5
 
             def do_GET(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler API)
                 parsed = urllib.parse.urlparse(self.path)
@@ -404,8 +411,14 @@ class CallbackListener:
                 self.send_response(status)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
+                # Answer once and go away. Without this the HTTP/1.1 handler
+                # loops back into readline and the connection never closes,
+                # which strands the client (browser or code exchange) even
+                # though the response itself was complete.
+                self.send_header("Connection", "close")
                 self.end_headers()
                 self.wfile.write(body)
+                self.close_connection = True
 
             def log_message(self, *args: Any) -> None:
                 """Silence the default stderr access log."""
@@ -422,8 +435,11 @@ class CallbackListener:
         return dict(self._params or {})
 
     def close(self) -> None:
+        # shutdown() stops the accept loop and waits for it to notice; the
+        # bound above keeps that wait finite even if a client is mid-request.
         self._server.shutdown()
         self._server.server_close()
+        self._thread.join(timeout=5)
 
 
 # ---------------------------------------------------------------------------
