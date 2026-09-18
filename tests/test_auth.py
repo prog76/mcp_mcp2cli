@@ -720,3 +720,24 @@ def test_callback_listener_still_captures_on_repeat_requests():
         assert listener.wait(5) == {"code": "abc", "state": "st"}
     finally:
         listener.close()
+
+
+def test_callback_listener_ignores_duplicate_and_truncated_callbacks():
+    """First callback wins; a later or truncated one must not clobber it.
+
+    Anton's manual curl arrived after the browser's callback carrying only
+    `state=` (his shell had split the URL on `&`). Pre-fix, any second request
+    overwrote the captured parameters - destroying the real code.
+    """
+    import httpx
+
+    listener = auth.CallbackListener("127.0.0.1", 0, "/callback")
+    try:
+        base = f"http://127.0.0.1:{listener.port}/callback"
+        # The real callback, complete.
+        assert httpx.get(f"{base}?code=GOOD&state=st", timeout=5).status_code == 200
+        # A duplicate / hand-pasted, truncated one.
+        assert httpx.get(f"{base}?state=st", timeout=5).status_code == 200
+        assert listener.wait(5) == {"code": "GOOD", "state": "st"}
+    finally:
+        listener.close()

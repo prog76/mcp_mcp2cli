@@ -403,8 +403,12 @@ class CallbackListener:
                 if parsed.path != listener._path:
                     self._respond(404, b"not found")
                     return
-                listener._params = dict(urllib.parse.parse_qsl(parsed.query))
-                listener._event.set()
+                if listener._params is None:
+                    # First callback wins (RFC 8252 7.6). Browsers retry, and a
+                    # hand-pasted callback usually carries a truncated query;
+                    # a later request must never overwrite the real code.
+                    listener._params = dict(urllib.parse.parse_qsl(parsed.query))
+                    listener._event.set()
                 self._respond(200, _SUCCESS_BODY)
 
             def _respond(self, status: int, body: bytes) -> None:
