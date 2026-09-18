@@ -77,6 +77,44 @@ def _split_server_prefix(tool_id: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Authorization
+# ---------------------------------------------------------------------------
+# An endpoint may require an OAuth bearer token: it answers 401 with an RFC 9728
+# challenge naming its protected-resource metadata. This client never runs a
+# login flow by itself -- minting a grant is an explicit operator action
+# (`mcp2cli auth login`). Here we only attach a stored token, refresh it when it
+# has expired, and turn a rejected request into a command the operator can run.
+
+_DEFAULT_HEADERS = {
+    "Accept": "application/json, text/event-stream",
+    "Content-Type": "application/json",
+}
+
+
+def _attach_auth(endpoint: str, hdrs: Dict[str, str]) -> None:
+    """Add the stored bearer token for ``endpoint`` to ``hdrs``, if there is one.
+
+    Not having a usable grant is not fatal: the request is sent unauthenticated
+    and a server that wants a token answers 401, which :func:`_auth_hint` turns
+    into instructions.
+    """
+    from mcp2cli import auth
+
+    token = auth.bearer_for(endpoint)
+    if token:
+        hdrs["Authorization"] = f"Bearer {token}"
+
+
+def _auth_hint(response: httpx.Response, endpoint: str) -> Optional[str]:
+    """The 'run mcp2cli auth login' hint for a bearer challenge, else None."""
+    from mcp2cli import auth
+
+    return auth.challenge_hint(
+        response.headers.get("WWW-Authenticate", ""), endpoint
+    )
+
+
+# ---------------------------------------------------------------------------
 # MCP session reuse cache
 # ---------------------------------------------------------------------------
 # Reuses the same Mcp-Session-Id across multiple calls to the same endpoint
@@ -179,6 +217,7 @@ async def _initialize_session(
         "jsonrpc": "2.0",
         "id": 1,
     }
+    _attach_auth(endpoint, hdrs)
     resp = await c.post(endpoint, json=init_req, headers=hdrs)
     resp.raise_for_status()
 
@@ -218,10 +257,8 @@ async def _fetch_tool_list_unbounded(endpoint: str) -> List[Dict[str, Any]]:
     Prefer :func:`_fetch_tool_list_live`, which wraps this in a timeout. This
     split exists so the timeout boundary is explicit and testable.
     """
-    hdrs = {
-        "Accept": "application/json, text/event-stream",
-        "Content-Type": "application/json",
-    }
+    hdrs = dict(_DEFAULT_HEADERS)
+    _attach_auth(endpoint, hdrs)
     async with httpx.AsyncClient(timeout=120, follow_redirects=True) as c:
         # Ensure a cached session (reuses Mcp-Session-Id across calls)
         await _ensure_session(c, endpoint, hdrs)
@@ -244,6 +281,11 @@ async def _fetch_tool_list_unbounded(endpoint: str) -> List[Dict[str, Any]]:
                 await _ensure_session(c, endpoint, hdrs)
                 resp2 = await c.post(endpoint, json=list_req, headers=hdrs)
                 resp2.raise_for_status()
+            elif e.response.status_code in (401, 403):
+                hint = _auth_hint(e.response, endpoint)
+                if hint:
+                    raise RuntimeError(hint) from e
+                raise
             else:
                 raise
 
@@ -392,10 +434,8 @@ async def _call_tool_live(
         This implementation uses raw HTTP (like skill_runner.py) to ensure
     the session header is always included.
     """
-    hdrs = {
-        "Accept": "application/json, text/event-stream",
-        "Content-Type": "application/json",
-    }
+    hdrs = dict(_DEFAULT_HEADERS)
+    _attach_auth(endpoint, hdrs)
     # Forward the kernel's stable operator session (MCP_SESSION_ID, injected by
     # the gateway policy from the operator's inbound Mcp-Session-Id) under a
     # dedicated header. The gateway keys its per-session confirm bypass
@@ -432,6 +472,11 @@ async def _call_tool_live(
                 await _ensure_session(c, endpoint, hdrs)
                 resp2 = await c.post(endpoint, json=call_req, headers=hdrs)
                 resp2.raise_for_status()
+            elif e.response.status_code in (401, 403):
+                hint = _auth_hint(e.response, endpoint)
+                if hint:
+                    raise RuntimeError(hint) from e
+                raise
             else:
                 raise
 

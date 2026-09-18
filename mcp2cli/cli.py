@@ -272,6 +272,75 @@ def cmd_describe(args: argparse.Namespace) -> int:
     return 0
 
 
+def _auth_overrides(args: argparse.Namespace) -> Dict[str, Any]:
+    """Collect the flags that override the OAuth environment config."""
+    return {
+        "client_id": getattr(args, "client_id", None),
+        "scopes": getattr(args, "scopes", None),
+        "redirect_host": getattr(args, "redirect_host", None),
+        "redirect_port": getattr(args, "redirect_port", None),
+        "callback_path": getattr(args, "callback_path", None),
+        "login_timeout_seconds": getattr(args, "login_timeout", None),
+    }
+
+
+def cmd_auth_login(args: argparse.Namespace) -> int:
+    """Print the login link, listen on loopback, store the grant."""
+    from mcp2cli import auth
+
+    endpoint = args.endpoint
+    try:
+        config = auth.load_config(_auth_overrides(args))
+    except auth.OAuthError as e:
+        print(f"{e}", file=sys.stderr)
+        return 2
+
+    try:
+        tokens = auth.login(endpoint, config=config, open_browser=args.open_browser)
+    except auth.OAuthError as e:
+        print(f"login failed: {e}", file=sys.stderr)
+        return 1
+
+    body = auth.status(endpoint)
+    print(
+        f"Signed in (client {tokens.client_id}, issuer {tokens.issuer}); "
+        f"grant stored at {body['path']}",
+        file=sys.stderr,
+    )
+    print(json.dumps(body, indent=2))
+    return 0
+
+
+def cmd_auth_status(args: argparse.Namespace) -> int:
+    """Report the stored grant for an endpoint, or its absence."""
+    from mcp2cli import auth
+
+    body = auth.status(args.endpoint)
+    print(json.dumps(body, indent=2))
+    if not body["configured"]:
+        print(
+            f"No OAuth grant for {args.endpoint}.\n"
+            f"  Mint one with: mcp2cli auth login --endpoint {args.endpoint}",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
+def cmd_auth_logout(args: argparse.Namespace) -> int:
+    """Delete the stored grant for an endpoint."""
+    from mcp2cli import auth
+
+    store = auth.TokenStore()
+    removed = store.delete(args.endpoint)
+    print(
+        f"{'Removed' if removed else 'No'} stored grant for {args.endpoint} "
+        f"({store.path_for(args.endpoint)})",
+        file=sys.stderr,
+    )
+    return 0
+
+
 def cmd_call(args: argparse.Namespace) -> int:
     endpoint = args.endpoint
     cache_dir = Path(args.cache_dir)
@@ -556,6 +625,84 @@ def main(argv: Optional[List[str]] = None) -> int:
         default=int(os.environ.get("MCP2CLI_OUTPUT_THRESHOLD_CHARS", DEFAULT_OUTPUT_THRESHOLD_CHARS)),
     )
     p_get_prompt.set_defaults(func=cmd_get_prompt)
+
+    p_auth = sub.add_parser(
+        "auth",
+        help="Manage the OAuth bearer grant for an endpoint",
+        epilog=(
+            "examples:\n"
+            "  mcp2cli auth login --endpoint https://host/servers/<id>/mcp\n"
+            "  mcp2cli auth status --endpoint https://host/servers/<id>/mcp\n"
+            "  mcp2cli auth logout --endpoint https://host/servers/<id>/mcp\n"
+            "\n"
+            "notes:\n"
+            "  - login prints an authorization URL and waits on a loopback\n"
+            "    listener for the browser redirect (RFC 8252), so it must run\n"
+            "    where the browser can reach the printed redirect URI\n"
+            "  - the grant is cached per endpoint and used automatically by\n"
+            "    every other subcommand; it is refreshed when expired\n"
+            "  - client id and scopes come from MCP2CLI_OAUTH_CLIENT_ID /\n"
+            "    MCP2CLI_OAUTH_SCOPES, or from the flags below\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    auth_sub = p_auth.add_subparsers(dest="auth_cmd", required=True)
+
+    def _add_login_flags(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument(
+            "--endpoint",
+            default=os.environ.get("MCP_ENDPOINT", DEFAULT_ENDPOINT),
+            help="MCP URL (the OAuth-protected resource)",
+        )
+        parser.add_argument(
+            "--client-id",
+            default=None,
+            help="OAuth client id (default: $MCP2CLI_OAUTH_CLIENT_ID)",
+        )
+        parser.add_argument(
+            "--scopes",
+            default=None,
+            help="Space-separated scopes (default: $MCP2CLI_OAUTH_SCOPES, else the resource's)",
+        )
+        parser.add_argument(
+            "--redirect-host",
+            default=None,
+            help="Loopback callback host (default: localhost)",
+        )
+        parser.add_argument(
+            "--redirect-port",
+            type=int,
+            default=None,
+            help="Loopback callback port, 0 for an ephemeral one (default: 0)",
+        )
+        parser.add_argument(
+            "--callback-path",
+            default=None,
+            help="Loopback callback path (default: /callback)",
+        )
+        parser.add_argument(
+            "--login-timeout",
+            type=int,
+            default=None,
+            help="Seconds to wait for the browser redirect (default: 300)",
+        )
+
+    p_auth_login = auth_sub.add_parser("login", help="Mint and store a grant for an endpoint")
+    _add_login_flags(p_auth_login)
+    p_auth_login.add_argument(
+        "--open-browser",
+        action="store_true",
+        help="Also try to launch the authorization URL locally (default: only print it)",
+    )
+    p_auth_login.set_defaults(func=cmd_auth_login)
+
+    p_auth_status = auth_sub.add_parser("status", help="Show the stored grant for an endpoint")
+    _add_login_flags(p_auth_status)
+    p_auth_status.set_defaults(func=cmd_auth_status)
+
+    p_auth_logout = auth_sub.add_parser("logout", help="Delete the stored grant for an endpoint")
+    _add_login_flags(p_auth_logout)
+    p_auth_logout.set_defaults(func=cmd_auth_logout)
 
     argv = sys.argv[1:] if argv is None else list(argv)
     args = parser.parse_args(_rewrite_direct_kv(argv))
